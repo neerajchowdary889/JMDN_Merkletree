@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"hash"
+	"math"
 )
 
 type Hash32 [32]byte
@@ -48,10 +49,26 @@ type HashFactory func() hash.Hash
 func DefaultHashFactory() hash.Hash { return sha256.New() }
 
 type Config struct {
-	BlockMerge  int
-	HashFactory HashFactory
+	// If 0, defaults to max(200, 0.5% of ExpectedTotal).
+	BlockMerge    int
+	ExpectedTotal uint64 // Hint for calculating BlockMerge
+	HashFactory   HashFactory
 	// Optional: if set, Builder enforces contiguous heights starting at StartHeight.
 	StartHeight *uint64
+}
+
+type Metadata struct {
+	Start uint64 // start block height of this subtree
+	Count uint32 // number of blocks covered by this subtree
+}
+
+type Node struct {
+	Left     *Node
+	Right    *Node
+	Root     Hash32   // subtree commitment
+	Metadata Metadata // range-tag
+	Data     Hash32   // leaf payload hash (for leaves); zero for internal nodes
+	HasData  bool     // true for leaves
 }
 
 type Builder struct {
@@ -72,8 +89,12 @@ type Builder struct {
 }
 
 func NewBuilder(cfg Config) (*Builder, error) {
+	// Dynamic BlockMerge calculation
 	if cfg.BlockMerge <= 0 {
-		cfg.BlockMerge = 200
+		cfg.BlockMerge = int(math.Ceil(float64(cfg.ExpectedTotal) * 0.005))
+		if cfg.BlockMerge < 1 {
+			cfg.BlockMerge = 1
+		}
 	}
 	if cfg.HashFactory == nil {
 		cfg.HashFactory = func() hash.Hash { return DefaultHashFactory() }
@@ -181,6 +202,16 @@ func (b *Builder) Finalize() (Hash32, error) {
 	return b.outer.Root(), nil
 }
 
+// RootNode returns the single root Node of the entire tree.
+func (b *Builder) RootNode() (*Node, error) {
+	if len(b.inChunkElems) > 0 {
+		if err := b.commitCurrentChunk(); err != nil {
+			return nil, err
+		}
+	}
+	return b.outer.RootNode(), nil
+}
+
 // Commit the current chunk (full or partial) into the outer accumulator, then reset in-chunk state.
 func (b *Builder) commitCurrentChunk() error {
 	if len(b.inChunkElems) == 0 {
@@ -194,11 +225,17 @@ func (b *Builder) commitCurrentChunk() error {
 	chunk := chunkDigest(b.cfg.HashFactory, start, count, b.inChunkElems)
 
 	// Add to outer accumulator as a leaf node with explicit range.
-	if err := b.outer.AddLeaf(node{
-		start: start,
-		count: count,
-		sum:   chunk,
-	}); err != nil {
+	leaf := &Node{
+		Root: chunk,
+		Metadata: Metadata{
+			Start: start,
+			Count: count,
+		},
+		Data:    chunk,
+		HasData: true,
+	}
+
+	if err := b.outer.AddLeaf(leaf); err != nil {
 		return err
 	}
 
@@ -217,6 +254,8 @@ func (b *Builder) Snapshot() ([]byte, error) {
 	if err := writeU32(&buf, uint32(b.cfg.BlockMerge)); err != nil {
 		return nil, err
 	}
+	// Note: We don't serialize ExpectedTotal, strictly speaking it's config.
+	// But BlockMerge is the critical derived value.
 	// We do NOT serialize HashFactory; caller must restore with same config.
 
 	// Height enforcement
@@ -270,7 +309,10 @@ func (b *Builder) Restore(snapshot []byte) error {
 	if err != nil {
 		return err
 	}
+	// If config wasn't set or differs, overwrite or error?
+	// The builder should respect the snapshot's structure choice.
 	if int(blockMerge) != b.cfg.BlockMerge {
+		// Strict check or adapt?
 		return fmt.Errorf("snapshot blockMerge %d != builder blockMerge %d", blockMerge, b.cfg.BlockMerge)
 	}
 
@@ -302,8 +344,10 @@ func (b *Builder) Restore(snapshot []byte) error {
 	if err != nil {
 		return err
 	}
+	// The snapshot's inChunkCount must not exceed the builder's current blockMerge config.
+	// This is a sanity check, as the builder's buffer capacity is based on its config.
 	if int(n) > b.cfg.BlockMerge {
-		return fmt.Errorf("snapshot inChunkCount %d > blockMerge %d", n, b.cfg.BlockMerge)
+		return fmt.Errorf("snapshot inChunkCount %d > builder blockMerge %d", n, b.cfg.BlockMerge)
 	}
 	b.inChunkElems = make([]Hash32, 0, b.cfg.BlockMerge)
 	for i := 0; i < int(n); i++ {
@@ -333,29 +377,31 @@ func (b *Builder) Restore(snapshot []byte) error {
 // If you want a chunk-committable wrapper, set wrap=true to return
 // H(tagChunkMerk || start || count || innerRoot).
 func InnerMerkleForRange(hf HashFactory, startHeight uint64, blockHashes []Hash32, wrap bool) (Hash32, error) {
+	// Re-uses local accumulator logic but with simpler nodes?
+	// Actually we can reuse peaksAccumulator with new Node struct trivially.
 	if hf == nil {
 		hf = func() hash.Hash { return DefaultHashFactory() }
 	}
 	if len(blockHashes) == 0 {
 		return Hash32{}, nil
 	}
-	// Use an accumulator to avoid building a full tree in memory.
 	acc := newPeaksAccumulator(hf, innerNodeDigest)
 
 	for i, bh := range blockHashes {
 		height := startHeight + uint64(i)
-		leaf := innerLeafDigest(hf, height, bh)
-		if err := acc.AddLeaf(node{
-			start: height,
-			count: 1,
-			sum:   leaf,
-		}); err != nil {
+		leafHash := innerLeafDigest(hf, height, bh)
+		leaf := &Node{
+			Root:     leafHash,
+			Metadata: Metadata{Start: height, Count: 1},
+			Data:     leafHash, // Or block hash? Usually derived.
+			HasData:  true,
+		}
+		if err := acc.AddLeaf(leaf); err != nil {
 			return Hash32{}, err
 		}
 	}
 
 	root := acc.Root()
-	// Now bind the final root to the full range explicitly.
 	if wrap {
 		h := hf()
 		h.Write([]byte{tagChunkMerk})
@@ -364,7 +410,6 @@ func InnerMerkleForRange(hf HashFactory, startHeight uint64, blockHashes []Hash3
 		h.Write(root[:])
 		return sumTo32(h), nil
 	}
-
 	return root, nil
 }
 
@@ -449,18 +494,12 @@ func sumTo32(h hash.Hash) Hash32 {
 // Peaks accumulator (streaming Merkle)
 // ------------------------------
 
-type node struct {
-	start uint64
-	count uint32
-	sum   Hash32
-}
-
 type nodeCombiner func(hf HashFactory, start uint64, count uint32, left Hash32, right Hash32) Hash32
 
 type peaksAccumulator struct {
 	hf        HashFactory
 	combiner  nodeCombiner
-	peaks     []*node
+	peaks     []*Node
 	leafCount uint64 // number of leaves added
 }
 
@@ -468,9 +507,11 @@ func newPeaksAccumulator(hf HashFactory, combiner nodeCombiner) peaksAccumulator
 	return peaksAccumulator{hf: hf, combiner: combiner}
 }
 
-func (a *peaksAccumulator) AddLeaf(n node) error {
-	// Enforce contiguity when combining: left range must end exactly before right begins.
-	carry := &n
+func (a *peaksAccumulator) AddLeaf(leaf *Node) error {
+	if leaf == nil {
+		return errors.New("nil leaf")
+	}
+	carry := leaf
 	level := 0
 
 	for {
@@ -487,62 +528,84 @@ func (a *peaksAccumulator) AddLeaf(n node) error {
 		left := a.peaks[level]
 		right := carry
 
-		// Contiguity check: left.start + left.count == right.start
-		if left.start+uint64(left.count) != right.start {
+		// Contiguity check: left range must end exactly before right begins.
+		if left.Metadata.Start+uint64(left.Metadata.Count) != right.Metadata.Start {
 			return fmt.Errorf("non-contiguous combine at level %d: left [%d..%d] right [%d..%d]",
 				level,
-				left.start, left.start+uint64(left.count)-1,
-				right.start, right.start+uint64(right.count)-1,
+				left.Metadata.Start, left.Metadata.Start+uint64(left.Metadata.Count)-1,
+				right.Metadata.Start, right.Metadata.Start+uint64(right.Metadata.Count)-1,
 			)
 		}
 
-		combinedStart := left.start
-		combinedCount := left.count + right.count
-		combinedSum := a.combiner(a.hf, combinedStart, combinedCount, left.sum, right.sum)
+		parentStart := left.Metadata.Start
+		parentCount := left.Metadata.Count + right.Metadata.Count
+		parentRoot := a.combiner(a.hf, parentStart, parentCount, left.Root, right.Root)
+
+		parent := &Node{
+			Left:  left,
+			Right: right,
+			Root:  parentRoot,
+			Metadata: Metadata{
+				Start: parentStart,
+				Count: parentCount,
+			},
+			HasData: false,
+		}
 
 		// Clear this peak and carry to next level.
 		a.peaks[level] = nil
-		carry = &node{start: combinedStart, count: combinedCount, sum: combinedSum}
+		carry = parent
 		level++
 	}
 }
 
-func (a *peaksAccumulator) Root() Hash32 {
+func (a *peaksAccumulator) RootNode() *Node {
 	// Fold remaining peaks left-to-right.
 	// Peaks are stored by level, but because we add sequentially,
 	// higher levels contain "older" (left-side) ranges.
 	// To reconstruct the tree order, we must process from largest level (oldest) to smallest.
-	var root *node
+	var root *Node
 	for i := len(a.peaks) - 1; i >= 0; i-- {
 		p := a.peaks[i]
 		if p == nil {
 			continue
 		}
 		if root == nil {
-			// copy
-			tmp := *p
-			root = &tmp
+			root = p
 			continue
 		}
 		// Combine root (left) with p (right) ensuring contiguity.
-		if root.start+uint64(root.count) != p.start {
+		if root.Metadata.Start+uint64(root.Metadata.Count) != p.Metadata.Start {
 			// If this happens, inputs weren’t contiguous or caller mixed ranges.
-			// Return zero to avoid false confidence.
-			return Hash32{}
+			// Return nil to avoid false confidence.
+			return nil
 		}
-		root = &node{
-			start: root.start,
-			count: root.count + p.count,
-			sum:   a.combiner(a.hf, root.start, root.count+p.count, root.sum, p.sum),
+		start := root.Metadata.Start
+		count := root.Metadata.Count + p.Metadata.Count
+		sum := a.combiner(a.hf, start, count, root.Root, p.Root)
+
+		root = &Node{
+			Left:  root,
+			Right: p,
+			Root:  sum,
+			Metadata: Metadata{
+				Start: start,
+				Count: count,
+			},
 		}
 	}
-	if root == nil {
-		return Hash32{}
-	}
-	return root.sum
+	return root
 }
 
-// Encode serializes peaks and leafCount.
+func (a *peaksAccumulator) Root() Hash32 {
+	r := a.RootNode()
+	if r == nil {
+		return Hash32{}
+	}
+	return r.Root
+}
+
+// Encode stores only peaks (Start, Count, Root). Children are NOT serialized.
 func (a *peaksAccumulator) Encode(buf *bytes.Buffer) error {
 	if err := writeU64(buf, a.leafCount); err != nil {
 		return err
@@ -556,17 +619,18 @@ func (a *peaksAccumulator) Encode(buf *bytes.Buffer) error {
 			continue
 		}
 		buf.WriteByte(1)
-		if err := writeU64(buf, p.start); err != nil {
+		if err := writeU64(buf, p.Metadata.Start); err != nil {
 			return err
 		}
-		if err := writeU32(buf, p.count); err != nil {
+		if err := writeU32(buf, p.Metadata.Count); err != nil {
 			return err
 		}
-		buf.Write(p.sum[:])
+		buf.Write(p.Root[:])
 	}
 	return nil
 }
 
+// Decode restores peaks as Nodes with no children.
 func (a *peaksAccumulator) Decode(r *bytes.Reader) error {
 	lc, err := readU64(r)
 	if err != nil {
@@ -579,7 +643,7 @@ func (a *peaksAccumulator) Decode(r *bytes.Reader) error {
 		return err
 	}
 
-	a.peaks = make([]*node, int(n))
+	a.peaks = make([]*Node, int(n))
 	for i := 0; i < int(n); i++ {
 		b, err := r.ReadByte()
 		if err != nil {
@@ -601,7 +665,11 @@ func (a *peaksAccumulator) Decode(r *bytes.Reader) error {
 		if _, err := r.Read(s[:]); err != nil {
 			return err
 		}
-		a.peaks[i] = &node{start: start, count: count, sum: s}
+		// Restore as leafless node
+		a.peaks[i] = &Node{
+			Root:     s,
+			Metadata: Metadata{Start: start, Count: count},
+		}
 	}
 	return nil
 }

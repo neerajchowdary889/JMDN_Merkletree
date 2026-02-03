@@ -39,13 +39,13 @@ func (b *Builder) Visualize() {
 
 			// how many chunks this peak represents
 			chunks := uint64(1) << level
-			start := p.start
-			end := start + uint64(p.count) - 1
+			start := p.Metadata.Start
+			end := start + uint64(p.Metadata.Count) - 1
 
 			fmt.Printf("  ├─ Level %-2d  (%d chunks)\n", level, chunks)
 			fmt.Printf("  │    Range : [%d … %d]\n", start, end)
-			fmt.Printf("  │    Count : %d blocks\n", p.count)
-			fmt.Printf("  │    Hash  : %s\n", shortHash(p.sum))
+			fmt.Printf("  │    Count : %d blocks\n", p.Metadata.Count)
+			fmt.Printf("  │    Hash  : %s\n", shortHash(p.Root))
 		}
 
 		if !found {

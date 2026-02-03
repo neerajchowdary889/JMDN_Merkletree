@@ -6,22 +6,12 @@ import (
 
 // Bisect finds the first chunk (range of size <= BlockMerge) that differs
 // between this Builder (b) and another Builder (other).
-// It requires the full raw data (localHashes, remoteHashes) to recompute
-// sub-roots during the descent, as the Builder only stores Peaks.
-//
-// Arguments:
-//   - other: The remote builder state to compare against.
-//   - localHashes: The raw data backing 'b'.
-//   - remoteHashes: The raw data backing 'other'.
 //
 // Efficiency:
-//   - Compares existing peaks O(1).
-//   - Only re-hashes the specific path down to the mismatch O(log N * BlockMerge).
-func (b *Builder) Bisect(other *Builder, localHashes []Hash32, remoteHashes []Hash32) (start uint64, count uint32, err error) {
+//   - Traverses the in-memory tree nodes O(log N).
+//   - No re-hashing required.
+func (b *Builder) Bisect(other *Builder) (start uint64, count uint32, err error) {
 	// 1. Compare Peaks (MMR Scan)
-	// We scan from highest level (largest range) to lowest.
-	// This corresponds to a Left-to-Right scan in terms of range coverage.
-
 	peaks1 := b.outer.peaks
 	peaks2 := other.outer.peaks
 
@@ -31,7 +21,7 @@ func (b *Builder) Bisect(other *Builder, localHashes []Hash32, remoteHashes []Ha
 	}
 
 	for i := maxLevel - 1; i >= 0; i-- {
-		var p1, p2 *node
+		var p1, p2 *Node
 		if i < len(peaks1) {
 			p1 = peaks1[i]
 		}
@@ -43,23 +33,21 @@ func (b *Builder) Bisect(other *Builder, localHashes []Hash32, remoteHashes []Ha
 			continue
 		}
 
-		// Structural mismatch?
 		if p1 == nil || p2 == nil {
 			if p1 != nil {
-				return p1.start, p1.count, nil
+				return p1.Metadata.Start, p1.Metadata.Count, nil
 			}
-			return p2.start, p2.count, nil
+			return p2.Metadata.Start, p2.Metadata.Count, nil
 		}
 
 		// Content mismatch?
-		if p1.sum != p2.sum {
-			fmt.Printf("Bisecting Peak Level %d (Range %d..%d)\n", i, p1.start, p1.start+uint64(p1.count)-1)
-			return b.bisectRecursive(localHashes, remoteHashes, p1.start, p1.count)
+		if p1.Root != p2.Root {
+			fmt.Printf("Bisecting Peak Level %d (Range %d..%d)\n", i, p1.Metadata.Start, p1.Metadata.Start+uint64(p1.Metadata.Count)-1)
+			return b.bisectRecursive(p1, p2)
 		}
 	}
 
-	// 2. Compare Partial Buffer (if no peak mismatch)
-	// Peaks only cover committed chunks.
+	// 2. Compare Partial Buffer
 	if len(b.inChunkElems) != len(other.inChunkElems) {
 		return b.inChunkStart, uint32(min(len(b.inChunkElems), len(other.inChunkElems))), nil
 	}
@@ -72,54 +60,40 @@ func (b *Builder) Bisect(other *Builder, localHashes []Hash32, remoteHashes []Ha
 	return 0, 0, nil // No difference
 }
 
-func (b *Builder) bisectRecursive(local, remote []Hash32, start uint64, count uint32) (uint64, uint32, error) {
-	// Base Case: Single Chunk?
-	if count <= uint32(b.cfg.BlockMerge) {
-		return start, count, nil
+func (b *Builder) bisectRecursive(n1, n2 *Node) (uint64, uint32, error) {
+	// Base Case: Leaf Node (Chunk)
+	// If HasData or if we are at the bottom (no children but matching count).
+	if n1.HasData || n1.Left == nil {
+		return n1.Metadata.Start, n1.Metadata.Count, nil
 	}
 
-	// Recursive Step: Split Range
-	// Peaks in this MMR implementation are strictly Perfect Binary Trees (size 2^k chunks).
-	// So we can split perfectly in half.
-	leftCount := count / 2
-	rightCount := count - leftCount
+	// Ensure n2 matches structure. If n2 is somehow different structure, returns mismatch.
+	if n2.Left == nil {
+		// Structure mismatch at this level? return this range.
+		return n1.Metadata.Start, n1.Metadata.Count, nil
+	}
 
 	// Check Left Child First
-	// Range: [start, start + leftCount - 1]
+	left1 := n1.Left
+	left2 := n2.Left
 
-	// Optimization: Use lightweight recursive hasher instead of full Builder
-	leftHashLocal := b.computeSubtreeRoot(local, start, leftCount)
-	leftHashRemote := b.computeSubtreeRoot(remote, start, leftCount)
-
-	if leftHashLocal != leftHashRemote {
-		fmt.Printf(" -> Going Left ([%d..%d])\n", start, start+uint64(leftCount)-1)
-		return b.bisectRecursive(local, remote, start, leftCount)
+	if left1.Root != left2.Root {
+		fmt.Printf(" -> Going Left ([%d..%d])\n", left1.Metadata.Start, left1.Metadata.Start+uint64(left1.Metadata.Count)-1)
+		return b.bisectRecursive(left1, left2)
 	}
 
 	// Else go Right
-	fmt.Printf(" -> Going Right ([%d..%d])\n", start+uint64(leftCount), start+uint64(count)-1)
-	return b.bisectRecursive(local, remote, start+uint64(leftCount), rightCount)
-}
-
-// computeSubtreeRoot calculates the root of a Perfect Binary Tree covering `count` blocks
-// without allocating a new Builder.
-// Precondition: count is a multiple of BlockMerge * 2^k (or just > BlockMerge for inner nodes).
-func (b *Builder) computeSubtreeRoot(fullData []Hash32, start uint64, count uint32) Hash32 {
-	// Base Case: Leaf (Chunk)
-	if count <= uint32(b.cfg.BlockMerge) {
-		subset := fullData[start : start+uint64(count)]
-		return ComputeChunkDigest(b.cfg.HashFactory, start, subset)
+	// If Right is nil? (Should not happen in perfect binary tree logic, but check)
+	if n1.Right == nil || n2.Right == nil {
+		// Should not happen if parents matched up to here and Left matched.
+		return n1.Metadata.Start, n1.Metadata.Count, nil
 	}
 
-	// Recursive Step: Inner Node
-	// Split in half
-	leftCount := count / 2
-	rightCount := count - leftCount
+	right1 := n1.Right
+	// right2 := n2.Right
 
-	left := b.computeSubtreeRoot(fullData, start, leftCount)
-	right := b.computeSubtreeRoot(fullData, start+uint64(leftCount), rightCount)
-
-	return outerNodeDigest(b.cfg.HashFactory, start, count, left, right)
+	fmt.Printf(" -> Going Right ([%d..%d])\n", right1.Metadata.Start, right1.Metadata.Start+uint64(right1.Metadata.Count)-1)
+	return b.bisectRecursive(n1.Right, n2.Right) // Use explicit right child
 }
 
 func min(a, b int) int {

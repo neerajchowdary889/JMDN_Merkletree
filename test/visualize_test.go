@@ -3,6 +3,7 @@ package tests
 import (
 	"crypto/rand"
 	"fmt"
+	"math"
 	"math/big"
 	"testing"
 
@@ -11,7 +12,8 @@ import (
 
 func TestRandomizedDiff10k(t *testing.T) {
 	count := 10000
-	cfg := merkletree.Config{BlockMerge: 200}
+	blockmerge := math.Ceil(float64(count) * 0.005)
+	cfg := merkletree.Config{BlockMerge: int(blockmerge)}
 
 	fmt.Printf("Generating %d random blocks...\n", count)
 	hashes := make([]merkletree.Hash32, count)
@@ -42,9 +44,12 @@ func TestRandomizedDiff10k(t *testing.T) {
 	b2, _ := merkletree.NewBuilder(cfg)
 	b2.Push(0, hashes2)
 
+	b1.Visualize()
+	b2.Visualize()
+
 	// 3. Find Difference using Bisection
 	fmt.Println("Running BisectDifference...")
-	start, chunkCount, err := b1.Bisect(b2, hashes, hashes2)
+	start, chunkCount, err := b1.Bisect(b2)
 	if err != nil {
 		t.Fatalf("Bisect error: %v", err)
 	}
