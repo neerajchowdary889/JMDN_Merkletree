@@ -605,7 +605,7 @@ func (a *peaksAccumulator) Root() Hash32 {
 	return r.Root
 }
 
-// Encode stores only peaks (Start, Count, Root). Children are NOT serialized.
+// Encode serializes peaks and recursively serializes the entire tree structure.
 func (a *peaksAccumulator) Encode(buf *bytes.Buffer) error {
 	if err := writeU64(buf, a.leafCount); err != nil {
 		return err
@@ -614,23 +614,14 @@ func (a *peaksAccumulator) Encode(buf *bytes.Buffer) error {
 		return err
 	}
 	for _, p := range a.peaks {
-		if p == nil {
-			buf.WriteByte(0)
-			continue
-		}
-		buf.WriteByte(1)
-		if err := writeU64(buf, p.Metadata.Start); err != nil {
+		if err := encodeNode(buf, p); err != nil {
 			return err
 		}
-		if err := writeU32(buf, p.Metadata.Count); err != nil {
-			return err
-		}
-		buf.Write(p.Root[:])
 	}
 	return nil
 }
 
-// Decode restores peaks as Nodes with no children.
+// Decode restores the full tree structure recursively.
 func (a *peaksAccumulator) Decode(r *bytes.Reader) error {
 	lc, err := readU64(r)
 	if err != nil {
@@ -645,33 +636,129 @@ func (a *peaksAccumulator) Decode(r *bytes.Reader) error {
 
 	a.peaks = make([]*Node, int(n))
 	for i := 0; i < int(n); i++ {
-		b, err := r.ReadByte()
+		node, err := decodeNode(r)
 		if err != nil {
 			return err
 		}
-		if b == 0 {
-			a.peaks[i] = nil
-			continue
-		}
-		start, err := readU64(r)
-		if err != nil {
-			return err
-		}
-		count, err := readU32(r)
-		if err != nil {
-			return err
-		}
-		var s Hash32
-		if _, err := r.Read(s[:]); err != nil {
-			return err
-		}
-		// Restore as leafless node
-		a.peaks[i] = &Node{
-			Root:     s,
-			Metadata: Metadata{Start: start, Count: count},
-		}
+		a.peaks[i] = node
 	}
 	return nil
+}
+
+// ------------------------------
+// Recursive Node Serialization
+// ------------------------------
+
+// Node Type Tags
+const (
+	nodeTagNil      = 0x00
+	nodeTagLeaf     = 0x01 // HasData = true
+	nodeTagInternal = 0x02 // HasData = false, has Children
+)
+
+func encodeNode(buf *bytes.Buffer, n *Node) error {
+	if n == nil {
+		return buf.WriteByte(nodeTagNil)
+	}
+
+	if n.HasData {
+		// Leaf Node
+		if err := buf.WriteByte(nodeTagLeaf); err != nil {
+			return err
+		}
+		if err := writeU64(buf, n.Metadata.Start); err != nil {
+			return err
+		}
+		if err := writeU32(buf, n.Metadata.Count); err != nil {
+			return err
+		}
+		if _, err := buf.Write(n.Root[:]); err != nil {
+			return err
+		}
+		if _, err := buf.Write(n.Data[:]); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Internal Node
+	if err := buf.WriteByte(nodeTagInternal); err != nil {
+		return err
+	}
+	if err := writeU64(buf, n.Metadata.Start); err != nil {
+		return err
+	}
+	if err := writeU32(buf, n.Metadata.Count); err != nil {
+		return err
+	}
+	if _, err := buf.Write(n.Root[:]); err != nil {
+		return err
+	}
+
+	// Recurse children
+	if err := encodeNode(buf, n.Left); err != nil {
+		return err
+	}
+	if err := encodeNode(buf, n.Right); err != nil {
+		return err
+	}
+	return nil
+}
+
+func decodeNode(r *bytes.Reader) (*Node, error) {
+	tag, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+
+	if tag == nodeTagNil {
+		return nil, nil
+	}
+
+	start, err := readU64(r)
+	if err != nil {
+		return nil, err
+	}
+	count, err := readU32(r)
+	if err != nil {
+		return nil, err
+	}
+	var root Hash32
+	if _, err := r.Read(root[:]); err != nil {
+		return nil, err
+	}
+
+	n := &Node{
+		Root:     root,
+		Metadata: Metadata{Start: start, Count: count},
+	}
+
+	if tag == nodeTagLeaf {
+		var data Hash32
+		if _, err := r.Read(data[:]); err != nil {
+			return nil, err
+		}
+		n.Data = data
+		n.HasData = true
+		return n, nil
+	}
+
+	if tag == nodeTagInternal {
+		n.HasData = false
+		left, err := decodeNode(r)
+		if err != nil {
+			return nil, err
+		}
+		right, err := decodeNode(r)
+		if err != nil {
+			return nil, err
+		}
+		n.Left = left
+		n.Right = right
+		return n, nil
+	}
+
+	return nil, fmt.Errorf("unknown node tag: %x", tag)
 }
 
 // ------------------------------

@@ -1,7 +1,7 @@
 package merkletree
 
 import (
-	"fmt"
+	// "fmt"
 )
 
 // Bisect finds the first chunk (range of size <= BlockMerge) that differs
@@ -42,7 +42,7 @@ func (b *Builder) Bisect(other *Builder) (start uint64, count uint32, err error)
 
 		// Content mismatch?
 		if p1.Root != p2.Root {
-			fmt.Printf("Bisecting Peak Level %d (Range %d..%d)\n", i, p1.Metadata.Start, p1.Metadata.Start+uint64(p1.Metadata.Count)-1)
+			// fmt.Printf("Bisecting Peak Level %d (Range %d..%d)\n", i, p1.Metadata.Start, p1.Metadata.Start+uint64(p1.Metadata.Count)-1)
 			return b.bisectRecursive(p1, p2)
 		}
 	}
@@ -78,7 +78,7 @@ func (b *Builder) bisectRecursive(n1, n2 *Node) (uint64, uint32, error) {
 	left2 := n2.Left
 
 	if left1.Root != left2.Root {
-		fmt.Printf(" -> Going Left ([%d..%d])\n", left1.Metadata.Start, left1.Metadata.Start+uint64(left1.Metadata.Count)-1)
+		// fmt.Printf(" -> Going Left ([%d..%d])\n", left1.Metadata.Start, left1.Metadata.Start+uint64(left1.Metadata.Count)-1)
 		return b.bisectRecursive(left1, left2)
 	}
 
@@ -89,10 +89,10 @@ func (b *Builder) bisectRecursive(n1, n2 *Node) (uint64, uint32, error) {
 		return n1.Metadata.Start, n1.Metadata.Count, nil
 	}
 
-	right1 := n1.Right
+	// right1 := n1.Right
 	// right2 := n2.Right
 
-	fmt.Printf(" -> Going Right ([%d..%d])\n", right1.Metadata.Start, right1.Metadata.Start+uint64(right1.Metadata.Count)-1)
+	// fmt.Printf(" -> Going Right ([%d..%d])\n", right1.Metadata.Start, right1.Metadata.Start+uint64(right1.Metadata.Count)-1)
 	return b.bisectRecursive(n1.Right, n2.Right) // Use explicit right child
 }
 
