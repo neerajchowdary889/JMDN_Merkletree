@@ -54,7 +54,10 @@ import (
 var encoderPool = sync.Pool{
 	// Time: O(1) — constructs one encoder (pool miss only).
 	New: func() any {
-		e, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
+		// Default is SpeedDefault (3) which is a good compromise between speed and compression ratio.
+		// SpeedBestCompression (10) is the highest compression ratio but is also the slowest.
+		e, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
+		// e, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedBestCompression))
 		return e
 	},
 }
